@@ -29,6 +29,22 @@ export function sendJson(
   res.end(text);
 }
 
+/** Send a pre-serialized JSON body (already-built text, no re-stringify). */
+export function sendJsonText(
+  res: ServerResponse,
+  status: number,
+  text: string,
+  headers: Readonly<Record<string, string>> = {},
+): void {
+  res.writeHead(status, {
+    'content-type': JSON_TYPE,
+    'content-length': Buffer.byteLength(text),
+    'x-github-request-id': nextRequestId(),
+    ...headers,
+  });
+  res.end(text);
+}
+
 export function sendRaw(
   res: ServerResponse,
   status: number,
@@ -50,20 +66,22 @@ export function sendError(res: ServerResponse, status: number, message: string):
   sendJson(res, status, { message });
 }
 
-export function pathOf(req: IncomingMessage): string {
+/** Parse the request URL once: path + query share one `new URL` call. */
+export function parseUrl(req: IncomingMessage): { path: string; query: URLSearchParams } {
   try {
-    return new URL(req.url ?? '/', 'http://entry').pathname;
+    const url = new URL(req.url ?? '/', 'http://entry');
+    return { path: url.pathname, query: url.searchParams };
   } catch {
-    return '/';
+    return { path: '/', query: new URLSearchParams() };
   }
 }
 
+export function pathOf(req: IncomingMessage): string {
+  return parseUrl(req).path;
+}
+
 export function queryOf(req: IncomingMessage): URLSearchParams {
-  try {
-    return new URL(req.url ?? '/', 'http://entry').searchParams;
-  } catch {
-    return new URLSearchParams();
-  }
+  return parseUrl(req).query;
 }
 
 /** Bearer token from the Authorization header, or null. */
@@ -79,6 +97,22 @@ const MAX_BODY_BYTES = 128 * 1024 * 1024;
 
 /** Read the whole request body (buffered). Throws on overflow or stream error. */
 export function readBody(req: IncomingMessage): Promise<Buffer> {
+  // Fast path: a small body that already arrived sits in the stream's buffer
+  // and `read()` returns it synchronously — no 'data'/'end' round trip.
+  // Anything short of the declared length falls through to the event path,
+  // which picks up the bytes already read.
+  const expected = Number(req.headers['content-length'] ?? 0) || 0;
+  if (expected > 0 && expected <= MAX_BODY_BYTES) {
+    const parts: Buffer[] = [];
+    let size = 0;
+    let chunk: Buffer | null;
+    while ((chunk = req.read() as Buffer | null) !== null) {
+      parts.push(chunk);
+      size += chunk.length;
+    }
+    if (size >= expected) return Promise.resolve(Buffer.concat(parts, size).subarray(0, expected));
+    if (parts.length > 0) return readBodyRemainder(req, parts, size, expected);
+  }
   return new Promise<Buffer>((resolve, reject) => {
     const chunks: Buffer[] = [];
     let size = 0;
@@ -92,6 +126,24 @@ export function readBody(req: IncomingMessage): Promise<Buffer> {
       chunks.push(chunk);
     });
     req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('error', reject);
+  });
+}
+
+/** Event-based remainder of readBody after the synchronous drain got a prefix. */
+function readBodyRemainder(req: IncomingMessage, parts: Buffer[], size: number, expected: number): Promise<Buffer> {
+  return new Promise<Buffer>((resolve, reject) => {
+    let total = size;
+    req.on('data', (chunk: Buffer) => {
+      total += chunk.length;
+      if (total > MAX_BODY_BYTES) {
+        reject(new Error('request body too large'));
+        req.destroy();
+        return;
+      }
+      parts.push(chunk);
+    });
+    req.on('end', () => resolve(Buffer.concat(parts, total).subarray(0, expected)));
     req.on('error', reject);
   });
 }

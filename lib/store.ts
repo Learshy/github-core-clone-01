@@ -97,6 +97,22 @@ export interface Repo {
   commentSeq: number;
   /** Commits created by the server on this repo (contents PUT/DELETE, squash merges). */
   commitSeq: number;
+  /**
+   * Response caches (performance only — every cached value is a pure function
+   * of immutable state, so a hit returns exactly what recomputation would):
+   * - fetchCache: upload-pack/fetch response bytes, keyed by the request
+   *   fields. Safe forever: git objects are content-addressed and immutable,
+   *   so the plan for a given (wants, haves, depth, shallow) can never change.
+   * - refsVersion: bumped on every ref write; keys the refs advertisements.
+   * - infoRefsCache / lsRefsCache: refs advertisement bytes per key.
+   * - issueJsonCache: serialized single-issue JSON bodies, invalidated when
+   *   that issue is patched or commented on.
+   */
+  fetchCache: Map<string, Buffer>;
+  refsVersion: number;
+  infoRefsCache: Map<string, Buffer>;
+  lsRefsCache: Map<string, Buffer>;
+  issueJsonCache: Map<number, string>;
 }
 
 export const DEFAULT_LABELS: readonly { name: string; color: string; description: string }[] = [
@@ -107,6 +123,13 @@ export const DEFAULT_LABELS: readonly { name: string; color: string; description
   { name: 'good first issue', color: '7057ff', description: 'Good for newcomers' },
   { name: 'help wanted', color: '008672', description: 'Extra attention is needed' },
 ];
+
+/** Bump a repo's refs version after any ref write; refs advertisements are keyed on it. */
+export function bumpRefs(repo: Repo): void {
+  repo.refsVersion += 1;
+  repo.infoRefsCache.clear();
+  repo.lsRefsCache.clear();
+}
 
 /** SHA-1 oid of a git object: sha1("<type> <len>\0" + data). */
 export function objectId(type: GitObjectType, data: Buffer): string {
@@ -176,6 +199,11 @@ export class Store {
       prSeq: 0,
       commentSeq: 0,
       commitSeq: 0,
+      fetchCache: new Map<string, Buffer>(),
+      refsVersion: 0,
+      infoRefsCache: new Map<string, Buffer>(),
+      lsRefsCache: new Map<string, Buffer>(),
+      issueJsonCache: new Map<number, string>(),
     };
     this.repoSeq += 1;
     this.repos.set(repo.fullName, repo);

@@ -4,7 +4,7 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { PKT_DELIM, PKT_FLUSH, parsePktLines, pktLine, pktLineBuf, readPack, writePack } from './pack.ts';
 import { sendError, sendRaw } from './http.ts';
-import { objectId, type Repo } from './store.ts';
+import { bumpRefs, objectId, type Repo } from './store.ts';
 import { commitTree, isAncestor, parseCommit, parseTree, peelToNonTag } from './gitobj.ts';
 import type { Ctx } from '../app.ts';
 
@@ -45,20 +45,32 @@ function v0RefLines(repo: Repo, caps: string): Buffer[] {
   return lines;
 }
 
+/** The v2 capability advertisement never changes: one shared body. */
+const V2_ADVERTISEMENT = Buffer.concat([
+  pktLine('version 2\n'),
+  pktLine('fetch=shallow\n'),
+  pktLine('ls-refs=unborn\n'),
+  pktLine('object-format=sha1\n'),
+  PKT_FLUSH,
+]);
+
 function handleInfoRefs(ctx: Ctx, req: IncomingMessage, res: ServerResponse, repo: Repo, query: URLSearchParams): void {
   const service = query.get('service') ?? '';
   const isV2 = req.headers['git-protocol'] === 'version=2';
   if (isV2) {
     // v2 capability advertisement: exactly version 2, fetch=shallow, ls-refs=unborn,
     // object-format=sha1, then flush.
-    const body = Buffer.concat([
-      pktLine('version 2\n'),
-      pktLine('fetch=shallow\n'),
-      pktLine('ls-refs=unborn\n'),
-      pktLine('object-format=sha1\n'),
-      PKT_FLUSH,
-    ]);
-    sendRaw(res, 200, body, 'application/x-git-upload-pack-advertisement');
+    sendRaw(res, 200, V2_ADVERTISEMENT, 'application/x-git-upload-pack-advertisement');
+    return;
+  }
+  const cacheKey = `${service}\0${repo.refsVersion}`;
+  const cached = repo.infoRefsCache.get(cacheKey);
+  if (cached !== undefined) {
+    const contentType =
+      service === 'git-receive-pack'
+        ? 'application/x-git-receive-pack-advertisement'
+        : 'application/x-git-upload-pack-advertisement';
+    sendRaw(res, 200, cached, contentType);
     return;
   }
   const caps = service === 'git-receive-pack' ? RECEIVE_CAPS : UPLOAD_CAPS;
@@ -68,6 +80,7 @@ function handleInfoRefs(ctx: Ctx, req: IncomingMessage, res: ServerResponse, rep
     ...v0RefLines(repo, caps),
     PKT_FLUSH,
   ]);
+  repo.infoRefsCache.set(cacheKey, body);
   const contentType =
     service === 'git-receive-pack'
       ? 'application/x-git-receive-pack-advertisement'
@@ -134,13 +147,22 @@ function handleLsRefs(repo: Repo, lines: { type: string; data?: Buffer }[], res:
       args.prefixes.push(text.slice('ref-prefix '.length));
     }
   }
+  // Pure function of (refs, args): refs move, so the key carries refsVersion.
+  const cacheKey = `${repo.refsVersion}\0${args.peel ? 1 : 0}${args.unborn ? 1 : 0}${args.symrefs ? 1 : 0}\0${args.prefixes === null ? '' : args.prefixes.join(',')}`;
+  const cached = repo.lsRefsCache.get(cacheKey);
+  if (cached !== undefined) {
+    sendRaw(res, 200, cached, 'application/x-git-upload-pack-result');
+    return;
+  }
   const entries = listLsRefs(repo, args);
   const parts: Buffer[] = entries.map((entry) => {
     const attrs = entry.attrs.length === 0 ? '' : ` ${entry.attrs.join(' ')}`;
     return pktLine(`${entry.oid} ${entry.name}${attrs}\n`);
   });
   parts.push(PKT_FLUSH);
-  sendRaw(res, 200, Buffer.concat(parts), 'application/x-git-upload-pack-result');
+  const body = Buffer.concat(parts);
+  repo.lsRefsCache.set(cacheKey, body);
+  sendRaw(res, 200, body, 'application/x-git-upload-pack-result');
 }
 
 /** Wrap a packfile in sideband band-1 pkt-lines, ending with a flush.
@@ -292,6 +314,52 @@ function planFetch(
   return { objects: [...objects.values()], shallow, unshallow };
 }
 
+const FETCH_CACHE_MAX = 16;
+
+/**
+ * Fetch-response cache. A fetch response is a pure function of the request
+ * fields plus which of the named oids exist in the store — and git objects
+ * are content-addressed and immutable, so once those existence bits are
+ * fixed the plan can never change. The key therefore carries an existence
+ * bitmask for wants/haves; no invalidation is ever needed.
+ */
+function fetchCacheKey(
+  version: string,
+  wants: string[],
+  haves: string[],
+  depth: number | null,
+  clientShallow: string[],
+  done: boolean,
+  caps: string,
+  repo: Repo,
+): string {
+  const exists = (oids: string[]): string =>
+    oids.map((oid) => (repo.objects.has(oid) ? '1' : '0')).join('');
+  return [
+    version,
+    wants.join(','),
+    haves.join(','),
+    String(depth),
+    clientShallow.join(','),
+    done ? '1' : '0',
+    caps,
+    exists(wants),
+    exists(haves),
+  ].join('\0');
+}
+
+function fetchCacheGet(repo: Repo, key: string): Buffer | undefined {
+  return repo.fetchCache.get(key);
+}
+
+function fetchCacheSet(repo: Repo, key: string, body: Buffer): void {
+  if (repo.fetchCache.size >= FETCH_CACHE_MAX) {
+    const oldest = repo.fetchCache.keys().next().value;
+    if (oldest !== undefined) repo.fetchCache.delete(oldest);
+  }
+  repo.fetchCache.set(key, body);
+}
+
 function handleFetchV2(repo: Repo, lines: { type: string; data?: Buffer }[], res: ServerResponse): void {
   const wants: string[] = [];
   const haves: string[] = [];
@@ -307,18 +375,32 @@ function handleFetchV2(repo: Repo, lines: { type: string; data?: Buffer }[], res
     else if (text.startsWith('shallow ')) clientShallow.push(text.slice(8).trim());
     else if (text === 'done') done = true;
   }
-  const plan = planFetch(repo, wants, haves, depth, clientShallow);
-  // Negotiation round (no "done"): acknowledgments section only, ending with a flush.
+  // Negotiation round (no "done"): acknowledgments only — no plan needed.
   if (!done) {
+    const key = fetchCacheKey('v2', wants, haves, depth, clientShallow, false, '', repo);
+    const cached = fetchCacheGet(repo, key);
+    if (cached !== undefined) {
+      sendRaw(res, 200, cached, 'application/x-git-upload-pack-result');
+      return;
+    }
     const out: Buffer[] = [pktLine('acknowledgments\n')];
     const matchingHaves = haves.filter((have) => repo.objects.has(have));
     if (matchingHaves.length === 0) out.push(pktLine('NAK\n'));
     else for (const have of matchingHaves) out.push(pktLine(`ACK ${have}\n`));
     out.push(pktLine('ready\n'));
     out.push(PKT_FLUSH);
-    sendRaw(res, 200, Buffer.concat(out), 'application/x-git-upload-pack-result');
+    const body = Buffer.concat(out);
+    fetchCacheSet(repo, key, body);
+    sendRaw(res, 200, body, 'application/x-git-upload-pack-result');
     return;
   }
+  const key = fetchCacheKey('v2', wants, haves, depth, clientShallow, true, '', repo);
+  const cached = fetchCacheGet(repo, key);
+  if (cached !== undefined) {
+    sendRaw(res, 200, cached, 'application/x-git-upload-pack-result');
+    return;
+  }
+  const plan = planFetch(repo, wants, haves, depth, clientShallow);
   // "done" was sent: the acknowledgments section MUST be omitted. Response is
   // [shallow-info section] + packfile section, each with its header line.
   const out: Buffer[] = [];
@@ -330,7 +412,9 @@ function handleFetchV2(repo: Repo, lines: { type: string; data?: Buffer }[], res
   }
   out.push(pktLine('packfile\n'));
   out.push(...sidebandPackLines(writePack(plan.objects)));
-  sendRaw(res, 200, Buffer.concat(out), 'application/x-git-upload-pack-result');
+  const body = Buffer.concat(out);
+  fetchCacheSet(repo, key, body);
+  sendRaw(res, 200, body, 'application/x-git-upload-pack-result');
 }
 
 function handleUploadPackV0(repo: Repo, body: Buffer, res: ServerResponse): void {
@@ -367,6 +451,12 @@ function handleUploadPackV0(repo: Repo, body: Buffer, res: ServerResponse): void
       clientShallow.push(text.slice(8).trim());
     }
   }
+  const key = fetchCacheKey('v0', wants, haves, depth, clientShallow, true, caps, repo);
+  const cached = fetchCacheGet(repo, key);
+  if (cached !== undefined) {
+    sendRaw(res, 200, cached, 'application/x-git-upload-pack-result');
+    return;
+  }
   const plan = planFetch(repo, wants, haves, depth, clientShallow);
   const out: Buffer[] = [];
   const matchingHaves = haves.filter((have) => repo.objects.has(have));
@@ -383,7 +473,9 @@ function handleUploadPackV0(repo: Repo, body: Buffer, res: ServerResponse): void
   const sideband = caps.includes('side-band-64k') || caps.includes('side-band');
   if (sideband) out.push(...sidebandPackLines(pack));
   else out.push(pack);
-  sendRaw(res, 200, Buffer.concat(out), 'application/x-git-upload-pack-result');
+  const responseBody = Buffer.concat(out);
+  fetchCacheSet(repo, key, responseBody);
+  sendRaw(res, 200, responseBody, 'application/x-git-upload-pack-result');
 }
 
 function sendReceiveReport(res: ServerResponse, lines: string[], reportStatus: boolean, sideband: boolean): void {
@@ -467,6 +559,7 @@ function handleReceivePack(repo: Repo, body: Buffer, res: ServerResponse): void 
     if (error === null) {
       if (cmd.newOid === ZERO_OID) repo.refs.delete(cmd.ref);
       else repo.refs.set(cmd.ref, cmd.newOid);
+      bumpRefs(repo);
       reportLines.push(`ok ${cmd.ref}`);
     } else {
       reportLines.push(`ng ${cmd.ref} ${error}`);

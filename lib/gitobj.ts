@@ -181,7 +181,22 @@ export function commitAncestors(repo: Repo, tipOid: string): Set<string> {
 
 export function isAncestor(repo: Repo, ancestor: string, descendant: string): boolean {
   if (ancestor === descendant) return true;
-  return commitAncestors(repo, descendant).has(ancestor);
+  // Walk the ancestor set from the descendant and stop at the first hit.
+  // The old code built the whole set first (O(history) per push even when the
+  // answer is the immediate parent, as in every sequential push).
+  const start = peelToNonTag(repo, descendant);
+  const seen = new Set<string>();
+  const stack: string[] = [start];
+  while (stack.length > 0) {
+    const oid = stack.pop() as string;
+    if (seen.has(oid)) continue;
+    const obj = repo.objects.get(oid);
+    if (obj === undefined || obj.type !== 'commit') continue;
+    if (oid === ancestor) return true;
+    seen.add(oid);
+    for (const parent of parseCommit(obj.data).parents) stack.push(parent);
+  }
+  return false;
 }
 
 /** First common ancestor of two tips (BFS from both sides, nearest to `a` wins ties). */

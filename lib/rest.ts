@@ -11,6 +11,7 @@ import {
   paginate,
   sendError,
   sendJson,
+  sendJsonText,
   tryParseJsonBody,
 } from './http.ts';
 import {
@@ -23,7 +24,7 @@ import {
   parseCommit,
   treeFromFiles,
 } from './gitobj.ts';
-import { objectId, type Issue, type Pull, type Repo } from './store.ts';
+import { bumpRefs, objectId, type Issue, type Pull, type Repo } from './store.ts';
 import type { Ctx } from '../app.ts';
 
 export function repoJson(repo: Repo): Record<string, unknown> {
@@ -60,6 +61,15 @@ export function repoJson(repo: Repo): Record<string, unknown> {
     license: null,
     permissions: { admin: true, maintain: true, push: true, triage: true, pull: true },
   };
+}
+
+/** Serialized single-issue JSON (no trailing newline), cached per issue number. */
+function issueJsonText(repo: Repo, issue: Issue): string {
+  const cached = repo.issueJsonCache.get(issue.number);
+  if (cached !== undefined) return cached;
+  const text = JSON.stringify(issueJson(repo, issue));
+  repo.issueJsonCache.set(issue.number, text);
+  return text;
 }
 
 export function issueJson(repo: Repo, issue: Issue): Record<string, unknown> {
@@ -152,6 +162,7 @@ function commitTreeOnBranch(
   const epoch = nextCommitEpoch(repo);
   const oid = makeCommit(repo, treeOid, parents, message, ctx.viewerLogin, `${ctx.viewerLogin}@example.invalid`, epoch);
   repo.refs.set(`refs/heads/${branch}`, oid);
+  bumpRefs(repo);
   return oid;
 }
 
@@ -189,6 +200,8 @@ interface Route {
   pattern: RegExp;
   keys: string[];
   handler: RouteHandler;
+  /** The pattern string, kept so dispatch can bucket routes without regexes. */
+  source: string;
 }
 
 function route(method: string, pattern: string, handler: RouteHandler): Route {
@@ -197,7 +210,7 @@ function route(method: string, pattern: string, handler: RouteHandler): Route {
     keys.push(key);
     return '([^/]+)';
   });
-  return { method, pattern: new RegExp(`^${source}$`), keys, handler };
+  return { method, pattern: new RegExp(`^${source}$`), keys, handler, source: pattern };
 }
 
 function decodeSegment(value: string): string {
@@ -318,6 +331,7 @@ const routes: Route[] = [
       return;
     }
     repo.refs.set(ref, sha);
+    bumpRefs(repo);
     sendJson(res, 201, { ref, object: { sha, type: 'commit', url: '' } });
   }),
 
@@ -539,7 +553,7 @@ const issueRoutes: Route[] = [
       }
     }
     const issue = ctx.store.createIssue(repo, title, typeof input.body === 'string' ? input.body : '', labelNames, ctx.viewerLogin);
-    sendJson(res, 201, issueJson(repo, issue));
+    sendJsonText(res, 201, `${issueJsonText(repo, issue)}\n`);
   }),
 
   route('GET', '/api/v3/repos/{owner}/{repo}/issues', (ctx, req, res, params, query) => {
@@ -562,7 +576,7 @@ const issueRoutes: Route[] = [
       const link = linkHeader(urlFor, page, perPage, list.length);
       if (link !== null) headers.link = link;
     }
-    sendJson(res, 200, items.map((issue) => issueJson(repo, issue)), headers);
+    sendJsonText(res, 200, `[${items.map((issue) => issueJsonText(repo, issue)).join(',')}]\n`, headers);
   }),
 
   route('GET', '/api/v3/repos/{owner}/{repo}/issues/{number}', (ctx, _req, res, params) => {
@@ -573,7 +587,7 @@ const issueRoutes: Route[] = [
       sendError(res, 404, 'Not Found');
       return;
     }
-    sendJson(res, 200, issueJson(repo, issue));
+    sendJsonText(res, 200, `${issueJsonText(repo, issue)}\n`);
   }),
 
   route('PATCH', '/api/v3/repos/{owner}/{repo}/issues/{number}', (ctx, _req, res, params, _query, body) => {
@@ -589,7 +603,8 @@ const issueRoutes: Route[] = [
     if (typeof input.body === 'string') issue.body = input.body;
     if (input.state === 'open' || input.state === 'closed') issue.state = input.state;
     issue.updatedAt = ctx.store.stamp();
-    sendJson(res, 200, issueJson(repo, issue));
+    repo.issueJsonCache.delete(issue.number);
+    sendJsonText(res, 200, `${issueJsonText(repo, issue)}\n`);
   }),
 
   route('POST', '/api/v3/repos/{owner}/{repo}/issues/{number}/comments', (ctx, _req, res, params, _query, body) => {
@@ -611,6 +626,7 @@ const issueRoutes: Route[] = [
       updatedAt: ctx.store.stamp(),
     };
     issue.comments.push(comment);
+    repo.issueJsonCache.delete(issue.number);
     sendJson(res, 201, {
       id: comment.id,
       body: comment.body,
@@ -770,6 +786,7 @@ export function squashMergePull(
     epoch,
   );
   repo.refs.set(`refs/heads/${pull.baseRef}`, mergeSha);
+  bumpRefs(repo);
   pull.state = 'closed';
   pull.merged = true;
   pull.mergedAt = ctx.store.stamp();
@@ -798,6 +815,41 @@ export function pullIsMergeable(repo: Repo, pull: Pull): boolean {
 
 const allRoutes: Route[] = [...routes, ...issueRoutes, ...pullRoutes];
 
+/**
+ * Dispatch buckets: routes are grouped by method + the resource segment
+ * after /api/v3/repos/{owner}/{repo}/ ('' for shorter or other paths), so a
+ * request only regex-tests the handful of routes it could match instead of
+ * all ~25. A route whose pattern has a parameter at that position lands in
+ * `routeAny` and is always tested (none exist today; the fallback keeps the
+ * index correct if one is added).
+ */
+function bucketOfPattern(method: string, pattern: string): string | null {
+  const segments = pattern.split('/');
+  if (segments.length <= 6 || segments[3] !== 'repos') return `${method}:`;
+  const seg = segments[6];
+  if (seg.startsWith('{')) return null;
+  return `${method}:${seg}`;
+}
+
+const routeBuckets = new Map<string, Route[]>();
+const routeAny: Route[] = [];
+for (const r of allRoutes) {
+  const bucket = bucketOfPattern(r.method, r.source);
+  if (bucket === null) {
+    routeAny.push(r);
+    continue;
+  }
+  const list = routeBuckets.get(bucket) ?? [];
+  list.push(r);
+  routeBuckets.set(bucket, list);
+}
+
+function bucketOfPath(method: string, path: string): string {
+  const segments = path.split('/');
+  if (segments.length <= 6 || segments[3] !== 'repos') return `${method}:`;
+  return `${method}:${segments[6]}`;
+}
+
 export async function handleRest(
   ctx: Ctx,
   req: IncomingMessage,
@@ -808,30 +860,33 @@ export async function handleRest(
   body: Buffer,
 ): Promise<void> {
   // Contents paths carry slashes in {path}: handle before the table.
-  const contentsMatch = /^\/api\/v3\/repos\/([^/]+)\/([^/]+)\/contents\/?(.*)$/.exec(path);
-  if (contentsMatch !== null) {
-    const repo = ctx.store.getRepo(decodeSegment(contentsMatch[1]), decodeSegment(contentsMatch[2]));
-    if (repo === undefined) {
-      sendError(res, 404, 'Not Found');
+  if (path.indexOf('/contents') !== -1) {
+    const contentsMatch = /^\/api\/v3\/repos\/([^/]+)\/([^/]+)\/contents\/?(.*)$/.exec(path);
+    if (contentsMatch !== null) {
+      const repo = ctx.store.getRepo(decodeSegment(contentsMatch[1]), decodeSegment(contentsMatch[2]));
+      if (repo === undefined) {
+        sendError(res, 404, 'Not Found');
+        return;
+      }
+      const contentPath = contentsMatch[3]
+        .split('/')
+        .map((segment) => decodeSegment(segment))
+        .join('/');
+      const parsed = tryParseJsonBody(body);
+      if (!parsed.ok) {
+        sendError(res, 400, 'Problems parsing JSON');
+        return;
+      }
+      if (method === 'PUT') contentsPut(ctx, res, repo, contentPath, parsed.value);
+      else if (method === 'GET') contentsGet(ctx, res, repo, contentPath, query);
+      else if (method === 'DELETE') contentsDelete(ctx, res, repo, contentPath, parsed.value);
+      else sendError(res, 404, 'Not Found');
       return;
     }
-    const contentPath = contentsMatch[3]
-      .split('/')
-      .map((segment) => decodeSegment(segment))
-      .join('/');
-    const parsed = tryParseJsonBody(body);
-    if (!parsed.ok) {
-      sendError(res, 400, 'Problems parsing JSON');
-      return;
-    }
-    if (method === 'PUT') contentsPut(ctx, res, repo, contentPath, parsed.value);
-    else if (method === 'GET') contentsGet(ctx, res, repo, contentPath, query);
-    else if (method === 'DELETE') contentsDelete(ctx, res, repo, contentPath, parsed.value);
-    else sendError(res, 404, 'Not Found');
-    return;
   }
 
-  for (const r of allRoutes) {
+  const candidates = [...(routeBuckets.get(bucketOfPath(method, path)) ?? []), ...routeAny];
+  for (const r of candidates) {
     if (r.method !== method) continue;
     const match = r.pattern.exec(path);
     if (match === null) continue;

@@ -1,6 +1,7 @@
 // pkt-line codec and git packfile read/write (plain objects only; deltas are read
 // and applied, never written). Pack objects are zlib streams; a stream's exact
-// length is recovered by binary search because inflateSync ignores trailing bytes.
+// length comes from inflateSync's `{ info: true }` report (engine.bytesWritten),
+// since trailing bytes after the stream end are ignored.
 import zlib from 'node:zlib';
 import { createHash } from 'node:crypto';
 
@@ -178,23 +179,20 @@ export function applyDelta(base: Buffer, delta: Buffer): Buffer {
   return result;
 }
 
-/** Minimal length of the zlib stream at the front of `buf` (binary search). */
-function zlibStreamLength(buf: Buffer): number {
-  let lo = 1;
-  let hi = buf.length;
-  let first = -1;
-  while (lo <= hi) {
-    const mid = (lo + hi) >> 1;
-    try {
-      zlib.inflateSync(buf.subarray(0, mid));
-      first = mid;
-      hi = mid - 1;
-    } catch {
-      lo = mid + 1;
-    }
-  }
-  if (first === -1) throw new Error('corrupt zlib stream in pack');
-  return first;
+/**
+ * Inflate the zlib stream at the front of `buf` and return its data plus the
+ * exact number of input bytes the stream consumed. One call does both:
+ * `inflateSync` with `{ info: true }` reports `engine.bytesWritten`, and
+ * trailing bytes after the stream end are ignored. (The old code recovered
+ * the length by binary search — ~12 trial inflations per object, most of
+ * them throwing — which dominated every push.)
+ */
+function inflatePackObject(buf: Buffer): { data: Buffer; consumed: number } {
+  const result = zlib.inflateSync(buf, { info: true }) as unknown as {
+    buffer: Buffer;
+    engine: { bytesWritten: number };
+  };
+  return { data: result.buffer, consumed: result.engine.bytesWritten };
 }
 
 export interface ReadPackObject {
@@ -246,8 +244,7 @@ export function readPack(pack: Buffer): ReadPackObject[] {
     } else if (type === 'refDelta') {
       throw new Error('ref-delta packs are not supported by this reader');
     }
-    const compressedLen = zlibStreamLength(pack.subarray(offset));
-    const raw = zlib.inflateSync(pack.subarray(offset, offset + compressedLen));
+    const { data: raw, consumed: compressedLen } = inflatePackObject(pack.subarray(offset));
     offset += compressedLen;
     if (type === 'ofsDelta') {
       const baseEntry = baseOffset === null ? undefined : byOffset.get(baseOffset);
