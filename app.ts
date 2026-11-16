@@ -3,7 +3,7 @@
 // /{owner}/{repo}.git/*. Everything else is a JSON 404. Auth: every API surface
 // requires Authorization: Bearer $MAKEFUN_SHOP_TOKEN; /healthz takes none.
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
-import { bearerToken, pathOf, queryOf, readBody, sendError, sendJson } from './lib/http.ts';
+import { bearerToken, parseUrl, readBody, sendError, sendJson } from './lib/http.ts';
 import { Store } from './lib/store.ts';
 import { scenarioUsers } from './lib/scenario.ts';
 import { handleRest } from './lib/rest.ts';
@@ -48,7 +48,7 @@ function isAuthed(ctx: Ctx, req: IncomingMessage): boolean {
 }
 
 async function dispatch(ctx: Ctx, req: IncomingMessage, res: ServerResponse): Promise<void> {
-  const path = pathOf(req);
+  const { path, query } = parseUrl(req);
   const method = req.method ?? 'GET';
 
   if (method === 'GET' && path === '/healthz') {
@@ -71,7 +71,7 @@ async function dispatch(ctx: Ctx, req: IncomingMessage, res: ServerResponse): Pr
   const gitMatch = /^\/([^/]+)\/([^/]+)\.git\/(info\/refs|git-upload-pack|git-receive-pack)$/.exec(path);
   if (gitMatch !== null) {
     const body = await readBody(req);
-    await handleGit(ctx, req, res, gitMatch[1], gitMatch[2], gitMatch[3], body, queryOf(req));
+    await handleGit(ctx, req, res, gitMatch[1], gitMatch[2], gitMatch[3], body, query);
     return;
   }
 
@@ -104,7 +104,6 @@ async function dispatch(ctx: Ctx, req: IncomingMessage, res: ServerResponse): Pr
       sendError(res, 401, 'Requires authentication');
       return;
     }
-    const query = queryOf(req);
     const body = method === 'GET' || method === 'HEAD' ? Buffer.alloc(0) : await readBody(req);
     await handleRest(ctx, req, res, path, method, query, body);
     return;
