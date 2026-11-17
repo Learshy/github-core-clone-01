@@ -107,12 +107,16 @@ export interface Repo {
    * - infoRefsCache / lsRefsCache: refs advertisement bytes per key.
    * - issueJsonCache: serialized single-issue JSON bodies, invalidated when
    *   that issue is patched or commented on.
+   * - issueListCache: serialized issue-list response bodies, keyed by the
+   *   normalized query (state|direction|page|per_page); cleared on every
+   *   issue/comment write, since any of them can change the list.
    */
   fetchCache: Map<string, Buffer>;
   refsVersion: number;
   infoRefsCache: Map<string, Buffer>;
   lsRefsCache: Map<string, Buffer>;
   issueJsonCache: Map<number, string>;
+  issueListCache: Map<string, { body: string; total: number }>;
 }
 
 export const DEFAULT_LABELS: readonly { name: string; color: string; description: string }[] = [
@@ -204,6 +208,7 @@ export class Store {
       infoRefsCache: new Map<string, Buffer>(),
       lsRefsCache: new Map<string, Buffer>(),
       issueJsonCache: new Map<number, string>(),
+      issueListCache: new Map<string, { body: string; total: number }>(),
     };
     this.repoSeq += 1;
     this.repos.set(repo.fullName, repo);

@@ -181,6 +181,7 @@ function callTool(ctx: Ctx, name: string, args: Record<string, unknown>): Record
       const repo = ctx.store.getRepo(owner, repoName);
       if (repo === undefined) return toolError(`Repository ${owner}/${repoName} not found`);
       const issue = ctx.store.createIssue(repo, title, asString(args.body) ?? '', [], ctx.viewerLogin);
+      repo.issueListCache.clear();
       return toolResult(issueJson(repo, issue));
     }
     case 'list_issues': {

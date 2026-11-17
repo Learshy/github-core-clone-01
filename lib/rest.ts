@@ -553,6 +553,7 @@ const issueRoutes: Route[] = [
       }
     }
     const issue = ctx.store.createIssue(repo, title, typeof input.body === 'string' ? input.body : '', labelNames, ctx.viewerLogin);
+    repo.issueListCache.clear();
     sendJsonText(res, 201, `${issueJsonText(repo, issue)}\n`);
   }),
 
@@ -561,22 +562,30 @@ const issueRoutes: Route[] = [
     if (repo === null) return;
     const state = query.get('state') ?? 'open';
     const { page, perPage } = pageParams(query);
-    let list = state === 'all' ? [...repo.issues] : repo.issues.filter((issue) => issue.state === state);
-    const direction = query.get('direction') === 'asc' ? 1 : -1;
-    list = [...list].sort((a, b) => (a.number - b.number) * direction);
-    const { items, hasNext } = paginate(list, page, perPage);
+    const direction = query.get('direction') === 'asc' ? 'asc' : 'desc';
+    const key = `${state}|${direction}|${page}|${perPage}`;
+    let cached = repo.issueListCache.get(key);
+    if (cached === undefined) {
+      const dir = direction === 'asc' ? 1 : -1;
+      const list =
+        state === 'all' ? [...repo.issues] : repo.issues.filter((issue) => issue.state === state);
+      list.sort((a, b) => (a.number - b.number) * dir);
+      const { items } = paginate(list, page, perPage);
+      cached = { body: `[${items.map((issue) => issueJsonText(repo, issue)).join(',')}]\n`, total: list.length };
+      repo.issueListCache.set(key, cached);
+    }
     const headers: Record<string, string> = {};
-    if (hasNext || page > 1) {
+    if (page * perPage < cached.total || page > 1) {
       const urlFor = (p: number): string => {
         const q = new URLSearchParams(query);
         q.set('page', String(p));
         q.set('per_page', String(perPage));
         return absoluteUrl(req, `/api/v3/repos/${params.owner}/${params.repo}/issues`, q);
       };
-      const link = linkHeader(urlFor, page, perPage, list.length);
+      const link = linkHeader(urlFor, page, perPage, cached.total);
       if (link !== null) headers.link = link;
     }
-    sendJsonText(res, 200, `[${items.map((issue) => issueJsonText(repo, issue)).join(',')}]\n`, headers);
+    sendJsonText(res, 200, cached.body, headers);
   }),
 
   route('GET', '/api/v3/repos/{owner}/{repo}/issues/{number}', (ctx, _req, res, params) => {
@@ -604,6 +613,7 @@ const issueRoutes: Route[] = [
     if (input.state === 'open' || input.state === 'closed') issue.state = input.state;
     issue.updatedAt = ctx.store.stamp();
     repo.issueJsonCache.delete(issue.number);
+    repo.issueListCache.clear();
     sendJsonText(res, 200, `${issueJsonText(repo, issue)}\n`);
   }),
 
@@ -627,6 +637,7 @@ const issueRoutes: Route[] = [
     };
     issue.comments.push(comment);
     repo.issueJsonCache.delete(issue.number);
+    repo.issueListCache.clear();
     sendJson(res, 201, {
       id: comment.id,
       body: comment.body,

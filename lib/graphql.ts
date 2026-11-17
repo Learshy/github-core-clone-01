@@ -784,6 +784,7 @@ registerResolvers('Mutation', {
     const repo = findRepo(ctx, decoded);
     if (repo === undefined) throw new Error('Repository not found');
     const issue = ctx.store.createIssue(repo, input.title, input.body ?? '', [], ctx.viewerLogin);
+    repo.issueListCache.clear();
     return { __typename: 'CreateIssuePayload', issue: { __typename: 'Issue', repo, issue } };
   },
   closeIssue: (_parent, args, ctx) => {
@@ -797,9 +798,10 @@ registerResolvers('Mutation', {
     if (repo === undefined || issue === undefined) throw new Error('Issue not found');
     issue.state = 'closed';
     issue.updatedAt = ctx.store.stamp();
-    // REST serves  single-issue JSON from repo.issueJsonCache: drop the stale entry
+    // REST serves single-issue JSON from repo.issueJsonCache: drop the stale entry
     // or the REST view keeps reporting the issue open after this mutation closes it.
     repo.issueJsonCache.delete(issue.number);
+    repo.issueListCache.clear();
     return { __typename: 'CloseIssuePayload', issue: { __typename: 'Issue', repo, issue } };
   },
   createPullRequest: (_parent, args, ctx) => {
@@ -842,6 +844,7 @@ registerResolvers('Mutation', {
     const comment = ctx.store.createComment(repo, issue, input.body, ctx.viewerLogin);
     // Same stale-cache rule as closeIssue: the comment count lives in the cached JSON.
     repo.issueJsonCache.delete(issue.number);
+    repo.issueListCache.clear();
     return {
       __typename: 'AddCommentPayload',
       commentEdge: {
